@@ -1,0 +1,237 @@
+---
+title: "Predict the Road Sign"
+author: "Shashank Sane"
+date: "June 12, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Synopsis
+
+Building digital maps is challenging, and maintaining it up to date in an ever-changing world is even more challenging. Various machine learning techniques helps us to detect road signs and changes in real world, and process it to update maps.
+
+The problem presented here is related to a step after detecting a sign on a road. This step has to now identify each road geometry on which this sign is applicable. While sounds like a simple problem, signs in junctions makes this more challenging.
+
+For example, given a sign detected on a road from a 4-camera setting on vehicle, the closest sighting of the sign may be in the right facing camera, with a sharp sign angle with respect to the direction of the car on which cameras set is mounted. Next step for updating map using this sign is to identify the exact road on which this sign is to be placed or applied.
+
+On a + junction, when a sign is detected on the right camera, its hard now to tell if this sign is for the straight road, or for the right-side road, unless you consider parameters like sign bounding box aspect ratio.
+
+For example, a sign detected from Front camera will have a natural aspect ratio of the sign when it is actually facing front of the car, however when same sign is detected on a right-side camera with a sharp angle from front, sign bounding box gets skewed, giving a hint that although its detected in right, it’s still facing the front of the car.
+
+Dataset provided here has details on camera sign was detected, Angle of sign with respect to front in degrees, Sign's reported bounding box aspect ratio (width/height), Sign Width and Height, and the target feature Sign Facing, which is where the sign is actually facing.
+
+Goal here is to predict where the sign is actually facing with respect to the vehicle, given above set of inputs.
+
+###
+load the required libraries
+```{r chunk1}
+library(plyr)
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(dummies)
+```
+
+###
+load data files
+```{r chunk10}
+
+dfTest <- read.csv("test.csv",stringsAsFactors = FALSE,na.strings = "NA")
+dfTrain <- read.csv("train.csv",stringsAsFactors = FALSE,na.strings = "NA")
+
+# check how many NA values are there
+table(is.na(dfTrain))
+
+## No NA values are found in above step.
+
+```
+###
+load cleaning and feature generation
+```{r chunk15}
+
+# first we will combine the training and test set so that we don't have to perform
+# data shaping twice
+
+# Add response column in test set
+dfTest$SignFacing..Target. <- 'UNK'
+
+# rowbind train and test set
+dfCombi <- rbind(dfTrain,dfTest)
+
+# Convert the Detected Camera and SignFacing..Target to factor variable
+dfCombi$DetectedCamera <- as.factor(dfCombi$DetectedCamera)
+dfCombi$SignFacing..Target. <- as.factor(dfCombi$SignFacing..Target.)
+
+# checking if any mismatched levels
+table(dfCombi$SignFacing..Target.)
+table(dfCombi$DetectedCamera)
+
+## No mismatched levels found
+
+# recode response variable
+dfCombi$SignFacing..Target. <- revalue(dfCombi$SignFacing..Target.,c("Front"=1,"Left"=2,"Rear"=3,"Right"=4,"UNK"=-1)) 
+
+## read about alternative ways of recoding values at: http://www.cookbook-r.com/Manipulating_data/Recoding_data/
+
+# Scale variables
+dfCombi[,3:6] <- scale(dfCombi[,3:6])
+
+# Now we will do one hot encoding for Detected Camera
+dfCombi <- dummy.data.frame(dfCombi,c('DetectedCamera'))
+
+# Now let's split back the training and test data:
+dfTest <- subset(dfCombi,SignFacing..Target.==-1)
+dfTrain <- subset(dfCombi,SignFacing..Target.!=-1)
+
+# re-factor to adjust factor levels (to remove factor level -1, due to dfCombi factor levels)
+## Notice that the same would not work with as.factor()
+dfTrain$SignFacing..Target. <- factor(dfTrain$SignFacing..Target.)
+
+# remove id column from dfTrain as it is not a predictor variable
+dfTrain <- dfTrain[,2:10]
+
+# remove SignFacing..Target. dummy column from test data frame
+dfTest <- dfTest[,1:9]
+
+```
+
+###
+Data modeling
+```{r chunk25}
+# create data partition
+intrain <- createDataPartition(dfTrain$SignFacing..Target.,p=0.8,list=FALSE)
+
+# create training subset:
+dfsubTrain <- dfTrain[intrain,]
+
+# create testing subset:
+dfsubTest <- dfTrain[-intrain,]
+
+# CV strategy
+## As the reponse is unbalanced among the possible output values, we would be 
+## using stratified CV.
+### stratified CV ensures that all the reponse values are represented in k foldes created.
+folds <- 5
+
+## defining createFolds ensures that stratification is done
+cvIndex <- createFolds(dfsubTrain$SignFacing..Target., folds, returnTrain = T)
+
+# define trainControl method
+fitControl <- trainControl(index = cvIndex,
+               method = 'cv', 
+               number = folds)
+
+#load libraries to do parallel process
+library(parallel)
+library(doParallel)
+
+
+# Initiate cluster and register for parallel processing
+cluster <- makeCluster(detectCores() - 1) # leave one core out for CPU
+registerDoParallel(cluster)
+
+# start stop watch to start measuring time for model training
+ptm <- proc.time()
+
+# train a random forest model on the training subset
+C.fit.rf <- train(SignFacing..Target.~., method="rf",data=dfsubTrain,trControl = fitControl)
+
+# take the difference between start time and end time to measure the time take for model training
+proc.time() -ptm
+
+# Stop our created cluster and De-register from parallel processing
+stopCluster(cluster)
+registerDoSEQ()
+
+print(C.fit.rf)
+
+confusionMatrix(dfsubTest,predict(dfsubTest, C.fit.rf))
+
+C.fit.rf$results
+```
+###
+using h2o
+```{r chunk30}
+
+library(h2o)
+localH2O <- h2o.init(nthreads = -1)
+h2o.init()
+
+train.h2o <- as.h2o(dfsubTrain)
+test.h2o <- as.h2o(dfsubTest)
+
+colnames(train.h2o)
+dim(train.h2o)
+
+## setting independent and dependent variables:
+y.dep <-9
+x.indep <- c(1:8)
+
+# predicting with random forest
+fit.rf <- h2o.randomForest(y=y.dep,x=x.indep,training_frame = train.h2o,seed=1234)
+
+predict.rf <- as.data.frame(predict(fit.rf,test.h2o))
+
+## Accuracy with Random Forest -- 96.39%, logloss: 0.1503208
+confusionMatrix(dfsubTest$SignFacing..Target.,predict.rf$predict)
+
+# predicting with GBM
+fit.gbm <- h2o.gbm(y=y.dep,x=x.indep,training_frame = train.h2o,seed=1234)
+
+predict.gbm <- as.data.frame(predict(fit.gbm,test.h2o))
+
+## Accuracy with Random Forest -- 96.63%, logloss:0.08786898
+confusionMatrix(dfsubTest$SignFacing..Target.,predict.gbm$predict)
+
+print(fit.rf)
+
+h2o.varimp_plot(fit.gbm)
+h2o.varimp_plot(fit.rf)
+
+# close the cluster once work is done
+h2o.shutdown()
+
+```
+
+
+###
+We will also check running on the entire train data frame:
+```{r chunk30}
+
+localH2O <- h2o.init(nthreads = -1)
+h2o.init()
+
+train.h2o <- as.h2o(dfTrain)
+
+# predicting with GBM
+fit.gbm.full <- h2o.gbm(y=y.dep,x=x.indep,training_frame = train.h2o,seed=1234)
+
+print(fit.gbm.full)
+
+# Confusion Matrix
+h2o.confusionMatrix(fit.gbm.full)
+
+```
+
+###
+Create output prediction file
+```{r chunk100}
+
+## Predict using h2o
+maintest.h20 <- as.h2o(dfTest)
+
+## Note that in the predict function we have used type="prob"
+## to get class probabilities
+predict.gbm <- as.data.frame(predict(fit.gbm.full,maintest.h20,type="prob"))
+
+dfResult = cbind(id= dfTest$Id,predict.gbm[,2:5])
+
+colnames(dfResult) <- c("Id","Front","Left","Rear","Right")
+
+write.csv(dfResult,'gbm_predict_raod_sign.csv')
+
+```
+## We get 99.8 % accuracy using above approach
